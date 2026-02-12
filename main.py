@@ -1,73 +1,98 @@
 import streamlit as st
-import zipfile
+import rarfile
 import os
-from openpyxl import Workbook
+import pandas as pd
 import tempfile
-from io import BytesIO
+import shutil
 
-st.set_page_config(page_title="ZIP Manifest Converter", layout="centered")
+st.title("Manifest & PCID Matcher")
 
-st.title("📂 ZIP to Excel Converter")
-st.write("Upload your `.zip` file to extract `.txt` manifests and convert them to Excel.")
+# Upload RAR file
+uploaded_file = st.file_uploader("Upload RAR File", type=["rar"])
 
-# File Uploader (Changed type to zip)
-uploaded_file = st.file_uploader("Choose a ZIP file", type="zip")
+def get_manifest_id(filename):
+    name_without_ext = os.path.splitext(filename)[0]
+    if "-" in name_without_ext:
+        part_before_hyphen = name_without_ext.split("-")[0]
+        if len(part_before_hyphen) >= 6:
+            return part_before_hyphen[-6:]
+    return None
 
-if uploaded_file is not None:
-    if st.button("Process File"):
-        with st.spinner("Extracting and processing..."):
-            # Create a temporary directory to handle extraction
-            with tempfile.TemporaryDirectory() as temp_dir:
-                try:
-                    # 1. Open the ZIP file directly from memory
-                    with zipfile.ZipFile(uploaded_file) as zf:
-                        zf.extractall(temp_dir)
+def get_pcid_id(filename):
+    name_without_ext = os.path.splitext(filename)[0]
+    if len(name_without_ext) >= 6:
+        return name_without_ext[-6:]
+    return None
 
-                    # 2. Prepare Excel Workbook
-                    wb = Workbook()
-                    ws = wb.active
-                    ws.title = "Data"
-                    ws.append(["Prefix", "Content"])
+if uploaded_file:
 
-                    files_found = 0
-                    
-                    # 3. Walk through directories to find .txt files
-                    for root, dirs, files in os.walk(temp_dir):
-                        for filename in files:
-                            # Filter: Ignore Mac system files and non-txt files
-                            if filename.endswith(".txt") and not filename.startswith("._") and "__MACOSX" not in root:
-                                file_path = os.path.join(root, filename)
-                                
-                                try:
-                                    # Logic: Split prefix and read content
-                                    prefix = filename.split("-")[0]
-                                    
-                                    with open(file_path, "r", encoding="utf-8") as f:
-                                        content = f.read().strip()
-                                    
-                                    ws.append([prefix, content])
-                                    files_found += 1
-                                except Exception as e:
-                                    st.warning(f"Skipped {filename}: {e}")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        rar_path = os.path.join(tmp_dir, uploaded_file.name)
 
-                    if files_found > 0:
-                        # 4. Save Excel to memory buffer
-                        excel_buffer = BytesIO()
-                        wb.save(excel_buffer)
-                        excel_buffer.seek(0)
+        # Save uploaded file
+        with open(rar_path, "wb") as f:
+            f.write(uploaded_file.read())
 
-                        st.success(f"Success! Processed {files_found} text files.")
-                        
-                        st.download_button(
-                            label="📥 Download Output Excel",
-                            data=excel_buffer,
-                            file_name="output.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    else:
-                        st.error("No .txt files found in the archive.")
+        # Extract RAR
+        try:
+            with rarfile.RarFile(rar_path) as rf:
+                rf.extractall(tmp_dir)
+            st.success("RAR Extracted Successfully!")
+        except Exception as e:
+            st.error(f"Extraction failed: {e}")
+            st.stop()
 
-                except zipfile.BadZipFile:
-                    st.error("Error: The file is corrupted or not a valid ZIP.")
-                except Exception as e:
-                    st.error(f"An unexpected error occurred: {e}")
+        # Locate folders
+        base_path = os.path.join(tmp_dir, "File Manifest & PCID")
+        manifest_path = os.path.join(base_path, "Manifest")
+        pcid_path = os.path.join(base_path, "PCID")
+
+        if not os.path.exists(manifest_path) or not os.path.exists(pcid_path):
+            st.error("Manifest or PCID folder not found!")
+            st.stop()
+
+        # Build PCID map
+        pcid_map = {}
+        for file in os.listdir(pcid_path):
+            if file.lower().endswith(".txt"):
+                key = get_pcid_id(file)
+                if key:
+                    pcid_map[key] = file
+
+        combined_data = []
+
+        # Match with Manifest
+        for file in os.listdir(manifest_path):
+            if file.lower().endswith(".txt"):
+                manifest_key = get_manifest_id(file)
+                if manifest_key and manifest_key in pcid_map:
+
+                    manifest_file_path = os.path.join(manifest_path, file)
+
+                    with open(manifest_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        manifest_content = f.read().strip()
+
+                    combined_data.append({
+                        'Match ID': manifest_key,
+                        'Manifest Filename': file,
+                        'PCID Filename': pcid_map[manifest_key],
+                        'Manifest Content': manifest_content,
+                        'PCID Content': pcid_map[manifest_key].replace(".txt","")
+                    })
+
+        if combined_data:
+            df = pd.DataFrame(combined_data)
+            st.success(f"{len(df)} matches found!")
+            st.dataframe(df)
+
+            output_file = "Combined_Manifest_PCID.xlsx"
+            df.to_excel(output_file, index=False)
+
+            with open(output_file, "rb") as f:
+                st.download_button(
+                    "Download Excel File",
+                    f,
+                    file_name=output_file
+                )
+        else:
+            st.warning("No matches found.")
